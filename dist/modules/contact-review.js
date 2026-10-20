@@ -1,0 +1,12 @@
+(function(root,factory){if(typeof module==='object'&&module.exports)module.exports=factory(require('../core.js'));else root.DeskModules.register(factory(root.DeskCore));})(typeof globalThis!=='undefined'?globalThis:this,function(C){
+'use strict';
+const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+return {id:'contact-review',apiVersion:1,title:'联系前回看',description:'按职位、对接人别名回看未完成承诺；职位变化始终单独展示。',render({state,asof,jobId,person=null}){
+ const j=state.jobs.find(x=>x.id===jobId)||state.jobs[0];
+ if(!j)return '<div class="empty"><strong>先建立一个工作职位</strong>记录承诺和变化后，即可在这里回看。</div>';
+ const aliases=[...new Set(state.commitments.filter(c=>c.job_id===j.id&&c.status==='pending').map(c=>c.person_alias||''))].sort((a,b)=>a.localeCompare(b,'zh-CN'));
+ if(person!==null&&!aliases.includes(person))person=null;
+ const {tasks,changes}=C.contactContext(state,j.id,person);
+ return '<section class="panel"><div class="doc"><h3>联系前回看</h3><p>仅按已录入的别名精确筛选；同名不代表同一个真实的人。</p><div class="field-row"><select id="review-job" aria-label="回看职位">'+state.jobs.map(x=>'<option value="'+esc(x.id)+'" '+(x.id===j.id?'selected':'')+'>'+esc(x.title)+(x.status==='closed'?'（已关闭）':'')+'</option>').join('')+'</select><select id="review-person" aria-label="回看对接人"><option value="*" '+(person===null?'selected':'')+'>全部对接人</option>'+aliases.map(p=>'<option value="'+esc(JSON.stringify(p))+'" '+(person===p?'selected':'')+'>'+esc(p||'无外部承诺人 · 内部待办')+'</option>').join('')+'</select></div><h3>'+esc(j.title)+' · '+esc(j.client_alias)+'</h3><p>当前筛选 '+tasks.length+' 项待跟进。评估日 '+esc(asof)+'。</p><h3>承诺与等待</h3>'+(tasks.length?tasks.map(c=>'<div class="note-block"><strong>'+esc(c.person_alias||'内部待办')+'</strong>：'+esc(c.action_text)+'<br>'+esc(c.condition_state==='waiting'?'等待：'+c.condition_note:c.due_confirmed?'已确认期限：'+c.due_date:'尚未确认期限')+(C.commitmentNotes(state,c.id)[0]?'<br>最近跟进（整条改期链）：'+esc(C.commitmentNotes(state,c.id)[0].occurred_on)+' '+esc(C.commitmentNotes(state,c.id)[0].note):'')+(c.reminder_on?'<br>内部回看日：'+esc(c.reminder_on):'')+'<br><button class="button-link" data-action="detail" data-id="'+esc(c.id)+'">打开原记录 →</button></div>').join(''):'<p>没有符合条件的未完成事项。</p>')+'<h3>职位全部有效变化（不按对接人筛选）</h3>'+(changes.length?changes.map(c=>'<div class="note-block">'+esc(c.happened_on)+'：'+esc(c.description)+'<br>来源：'+esc(c.source_note||'未提供')+'</div>').join(''):'<p>暂无有效变化记录。</p>')+'<p class="footnote">变化记录不是完整最新 JD。此视图只供内部回看，不发消息，不修改记录。</p></div></section>';
+}};
+});

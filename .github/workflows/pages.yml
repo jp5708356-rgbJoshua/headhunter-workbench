@@ -1,0 +1,40 @@
+name: Deploy demo to GitHub Pages
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build standalone application
+        run: python3 build.py
+      - name: Check business and storage behavior
+        run: node --test tests/*.test.cjs
+      - name: Check local launcher
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Build synthetic demo
+        run: python3 build_pages.py
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

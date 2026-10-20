@@ -1,0 +1,50 @@
+const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs');
+const C=require('../dist/core.js'),D=require('../dist/data.js'),S=require('../dist/storage.js'),M=require('../dist/modules.js');
+const raw=JSON.parse(fs.readFileSync(require('node:path').join(__dirname,'../dist/seed.js'),'utf8').replace(/^window\.DESK_SEED = /,'').replace(/;\s*$/,''));
+const initial=()=>D.validate(C.seed(raw)),now='2026-10-20T02:00:00.000Z';
+const clone=C.clone;
+function memory(){const values=new Map();return {getItem:k=>values.has(k)?values.get(k):null,setItem:(k,v)=>values.set(k,v),values};}
+function corrupt(check){const s=initial();check(s);assert.throws(()=>D.validate(s));}
+test('v1 fixtures migrate without changing commitments or losing unknown extension data',()=>{let s=C.seed(raw);s.extension_data={futureModule:{note:'保留'}},r=D.validate(s);assert.equal(r.data_version,D.VERSION);assert.deepEqual(r.commitments,s.commitments.map(c=>({...c,reminder_on:null})));assert.deepEqual(r.extension_data,s.extension_data);});
+test('fresh work workspace contains no synthetic jobs or commitments',()=>{let s=D.emptyWorkspace('me','workspace');assert.equal(s.dataset_kind,'work');assert.deepEqual(D.summary(s),{workspace:'work',users:1,jobs:0,changes:0,commitments:0,active:0});});
+test('reject unsupported future data versions',()=>corrupt(s=>s.data_version=99));
+test('reject duplicate identifiers',()=>corrupt(s=>s.commitments.push(clone(s.commitments[0]))));
+test('reject unsafe identifiers before rendering in HTML attributes',()=>corrupt(s=>s.jobs[0].id='bad" onclick="x'));
+test('reject orphan jobs, owners and wrong tenant',()=>{corrupt(s=>s.commitments[0].job_id='missing');corrupt(s=>s.commitments[0].assigned_to='missing');corrupt(s=>s.changes[0].tenant_id='another');});
+test('reject invalid dates and unknown states',()=>{corrupt(s=>s.commitments[0].due_date='2026-02-30');corrupt(s=>s.commitments[0].status='unknown');corrupt(s=>s.commitments[0].due_confirmed='true');});
+test('reject impossible timestamps rather than accepting automatic date rollover',()=>corrupt(s=>s.commitments[0].updated_at='2026-02-30T10:00:00Z'));
+test('reject incomplete waiting and conditional promises without state',()=>{corrupt(s=>{s.commitments[0].condition_state='waiting';});corrupt(s=>{s.commitments[0].modality='conditional';});});
+test('reject reschedule branches, missing successors and cycles',()=>{
+ corrupt(s=>{let c=clone(s.commitments.find(c=>c.id==='commit-syn-26'));c.id='branch';s.commitments.push(c);});
+ corrupt(s=>{s.commitments=s.commitments.filter(c=>c.id!=='commit-syn-26');});
+ corrupt(s=>{let a=s.commitments.find(c=>c.id==='commit-syn-25'),b=s.commitments.find(c=>c.id==='commit-syn-26');a.rescheduled_from=b.id;b.status='rescheduled';});
+});
+test('reject dangerous object keys in extension data',()=>{const s=initial();s.extension_data=JSON.parse('{"__proto__":{"x":true}}');assert.throws(()=>D.validate(s),/属性/);});
+test('SHA-256 full backup round trip retains every commitment and extension',async()=>{let s=initial();s.extension_data={later:{enabled:true}};let b=await D.backup(s,now);let r=await D.readBackup(JSON.stringify(b));assert.deepEqual(r.state,s);});
+test('changed backup content fails checksum and cannot be restored',async()=>{const b=await D.backup(initial(),now);b.state.commitments[0].action_text='篡改';await assert.rejects(D.readBackup(JSON.stringify(b)),/校验失败/);});
+test('plain export, invalid JSON, future format and oversized files rejected',async()=>{
+ await assert.rejects(D.readBackup('not json'),/JSON/);
+ await assert.rejects(D.readBackup(JSON.stringify(initial())),/完整备份/);
+ const b=await D.backup(initial(),now);b.backup_version=10;await assert.rejects(D.readBackup(JSON.stringify(b)),/完整备份/);
+ await assert.rejects(D.readBackup('x'.repeat(D.MAX_BYTES+1)),/10 MB/);
+});
+test('checksummed but invalid backup is still rejected by structural validation',async()=>{let b=await D.backup(initial(),now);b.state.commitments[0].job_id='missing';b.sha256=await D.sha256(JSON.stringify(b.state));await assert.rejects(D.readBackup(JSON.stringify(b)),/归属/);});
+test('storage corruption does not silently seed or overwrite records',()=>{const mem=memory();mem.setItem('data','{corrupt');const store=S.create(mem,'data');assert.throws(()=>store.read(),/原始数据已保留/);assert.equal(mem.getItem('data'),'{corrupt');});
+test('blocked storage read reports failure instead of showing successful save',()=>{let store=S.create({getItem(){throw Error('denied');}},'data');assert.throws(()=>store.read(),/拒绝读取/);});
+test('successful write preserves previous valid recovery point',()=>{const mem=memory(),store=S.create(mem,'data'),s=initial();store.write(s,null);let next=clone(s);next.jobs[0].title='修改后';store.write(next,store.raw());assert.equal(store.read().jobs[0].title,'修改后');assert.deepEqual(store.previous(),s);});
+test('quota failure leaves main data unchanged and raises actionable error',()=>{const mem=memory(),store=S.create(mem,'data'),s=initial();store.write(s,null);const original=mem.getItem('data');mem.setItem=(key,value)=>{if(key==='data')throw Error('quota');mem.values.set(key,value);};let next=clone(s);next.jobs[0].title='不能保存';assert.throws(()=>store.write(next,original),/保存失败/);assert.equal(mem.getItem('data'),original);});
+test('failure to save recovery point prevents destructive replacement',()=>{const mem=memory(),store=S.create(mem,'data');store.write(initial(),null);const original=store.raw();mem.setItem=()=>{throw Error('quota');};assert.throws(()=>store.write(initial(),original),/保存失败/);assert.equal(store.raw(),original);});
+test('compare before save rejects outdated whole-state replacement',()=>{const mem=memory(),store=S.create(mem,'data');store.write(initial(),null);const old=store.raw();const next=initial();next.jobs[0].title='来自另一页';store.write(next,old);assert.throws(()=>store.write(initial(),old),/其他页面/);assert.equal(store.read().jobs[0].title,'来自另一页');});
+test('restoring over corrupt data does not overwrite valid recovery point with corrupt bytes',()=>{const mem=memory(),store=S.create(mem,'data'),s=initial();store.write(s,null);store.write(s,store.raw());mem.setItem('data','{bad');store.write(s,'{bad');assert.deepEqual(store.previous(),s);});
+test('creating and editing a work job is validated and preserves its state',()=>{let s=D.emptyWorkspace('me','work');const op={tenant_id:'work',type:'create_job',id:'job',payload:{title:'医学经理',client_alias:'客户A'}};let r=C.apply(s,op,'me',now);D.validate(r.state);assert.equal(r.state.jobs[0].owner_id,'me');assert.equal(C.apply(r.state,op,'me',now).replayed,true);const j=r.state.jobs[0];let next=C.apply(r.state,{tenant_id:'work',type:'edit_job',id:j.id,expected_updated_at:j.updated_at,payload:{title:'医学总监',client_alias:'客户B'}},'me',now);assert.equal(next.state.jobs[0].title,'医学总监');D.validate(next.state);});
+test('commitment text editing cannot rewrite deadline, status, job or reschedule history',()=>{let s=initial(),c=s.commitments[0];let r=C.apply(s,{type:'edit_commitment',tenant_id:s.tenant_id,id:c.id,expected_updated_at:c.updated_at,payload:{...c,action_text:'修正文字',due_date:'2099-01-01',status:'done',job_id:'job-syn-02'}},'user-syn-01',now).state;let edited=r.commitments[0];assert.equal(edited.action_text,'修正文字');for(const key of ['due_date','status','job_id','rescheduled_from'])assert.equal(edited[key],c[key]);D.validate(r);});
+test('stale text editing and editing closed commitments rejected',()=>{let s=initial(),c=s.commitments[0];const op={type:'edit_commitment',tenant_id:s.tenant_id,id:c.id,payload:c};assert.throws(()=>C.apply(s,{...op,expected_updated_at:'2000-01-01'},'user-syn-01',now),/修改/);c.status='done';c.completed_at=now;assert.throws(()=>C.apply(s,{...op,expected_updated_at:c.updated_at},'user-syn-01',now),/未完成/);});
+test('multiple or uncertain date expressions never produce a single deadline',()=>{for(const x of ['下周三或周四','2026-10-21至2026-10-23','可能明天','不一定周五','2026-10-21改成2026-10-23'])assert.deepEqual(C.dateDraft(x,'2026-10-20').dates,[],x);assert.equal(C.parseDraft('HR-01：周三或周四反馈','2026-10-20').fallback,true);});
+test('yearless cross-year date yields explicit alternatives',()=>assert.deepEqual(C.dateDraft('1月2日','2026-12-30').dates,['2026-01-02','2027-01-02']));
+test('leap years, invalid month/day and bare source dates remain precise',()=>{assert.equal(C.validDate('2028-02-29'),true);assert.equal(C.validDate('2026-02-29'),false);assert.deepEqual(C.dateDraft('2026-13-01','2026-10-20').dates,[]);assert.deepEqual(C.dateDraft('2026-10-21','2026-10-20').dates,['2026-10-21']);});
+test('Shanghai midnight is independent of browser time zone',()=>{assert.equal(C.localDateFrom('2026-10-19T15:59:59Z'),'2026-10-19');assert.equal(C.localDateFrom('2026-10-19T16:00:00Z'),'2026-10-20');});
+test('invalid assessment dates cannot classify records as due',()=>assert.throws(()=>C.view(initial().commitments[0],''),/评估日期/));
+test('salary context does not auto-create a parsed commitment',()=>assert.equal(C.parseDraft('HR-01：月薪3万，年包40万','2026-10-20').fallback,true));
+test('requests, estimates and negative wording do not become definite promises',()=>{for(const x of ['HR-01：预计周五反馈','HR-01：请明天给反馈','HR-01：争取下周三安排','HR-01：不能周五反馈']){const p=C.parseDraft(x,'2026-10-20');assert.equal(p.fallback,true,x);assert.notEqual(p.modality,'definite',x);assert.deepEqual(p.date.dates,[],x);}});
+test('module registry rejects duplicates and unsupported APIs',()=>{assert.throws(()=>M.register({id:'bad',apiVersion:9,title:'bad',render(){}}),/接口/);M.register({id:'check',apiVersion:1,title:'测试',render:()=>'<p>OK</p>'});assert.throws(()=>M.register({id:'check',apiVersion:1,title:'重复',render(){}}),/重复/);assert.equal(M.render('check',{state:initial()}),'<p>OK</p>');});
+test('extension receives a frozen clone and cannot mutate source records',()=>{let s=initial();M.register({id:'immutable',apiVersion:1,title:'只读',render(ctx){assert.equal(Object.isFrozen(ctx.state.jobs[0]),true);return 'OK';}});M.render('immutable',{state:s});assert.equal(Object.isFrozen(s),false);});

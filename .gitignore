@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.env.*
+!.env.example
+node_modules/
+.private/
+*完整备份*.json
+*存储原文*.txt
